@@ -8,6 +8,7 @@ vi.mock("@actions/artifact", () => ({
   },
 }));
 
+import type { ArtifactUploadOutcome } from "../../src/artifact";
 import { ARTIFACT_NAME, RECEIPT_ARTIFACT_PREFIX, fallbackArtifactName, isArtifactNameCollision, receiptArtifactName, uploadReceipt, uploadReport } from "../../src/artifact";
 
 const REPORT_PATH = "/tmp/stellar-canary-report.json";
@@ -30,15 +31,26 @@ describe("uploadReport", () => {
   it("reports success and uses the fixed artifact name", async () => {
     uploadArtifactMock.mockResolvedValue({ id: 1, size: 100 });
     const outcome = await uploadReport(REPORT_PATH);
-    expect(outcome).toEqual({ uploaded: true });
+    expect(outcome).toEqual({ uploaded: true, name: ARTIFACT_NAME, id: 1 });
     expect(uploadArtifactMock).toHaveBeenCalledTimes(1);
     expect(uploadArtifactMock).toHaveBeenCalledWith(ARTIFACT_NAME, [REPORT_PATH], REPORT_DIR);
+  });
+
+  it("uploads additional files (e.g. the JUnit rendering) alongside the report (#423)", async () => {
+    uploadArtifactMock.mockResolvedValue({ id: 1, size: 100 });
+    const outcome = await uploadReport(REPORT_PATH, undefined, ["/tmp/stellar-canary-report.junit.xml"]);
+    expect(outcome).toEqual({ uploaded: true, name: ARTIFACT_NAME, id: 1 });
+    expect(uploadArtifactMock).toHaveBeenCalledWith(
+      ARTIFACT_NAME,
+      [REPORT_PATH, "/tmp/stellar-canary-report.junit.xml"],
+      REPORT_DIR,
+    );
   });
 
   it("keeps the stable name even when a differentiator is supplied but the name is free", async () => {
     uploadArtifactMock.mockResolvedValue({ id: 1, size: 100 });
     const outcome = await uploadReport(REPORT_PATH, "protocol-28");
-    expect(outcome).toEqual({ uploaded: true });
+    expect(outcome).toEqual({ uploaded: true, name: ARTIFACT_NAME, id: 1 });
     expect(uploadArtifactMock).toHaveBeenCalledTimes(1);
     expect(uploadArtifactMock).toHaveBeenCalledWith(ARTIFACT_NAME, [REPORT_PATH], REPORT_DIR);
   });
@@ -50,7 +62,11 @@ describe("uploadReport", () => {
 
     const outcome = await uploadReport(REPORT_PATH, "protocol-28-network-testnet");
 
-    expect(outcome).toEqual({ uploaded: true });
+    expect(outcome).toEqual({
+      uploaded: true,
+      name: `${ARTIFACT_NAME}-protocol-28-network-testnet`,
+      id: 2,
+    });
     expect(uploadArtifactMock).toHaveBeenCalledTimes(2);
     expect(uploadArtifactMock).toHaveBeenNthCalledWith(1, ARTIFACT_NAME, [REPORT_PATH], REPORT_DIR);
     expect(uploadArtifactMock).toHaveBeenNthCalledWith(
@@ -68,8 +84,11 @@ describe("uploadReport", () => {
       .mockRejectedValueOnce(conflictError())
       .mockResolvedValueOnce({ id: 2, size: 1 });
 
-    await uploadReport(REPORT_PATH, "protocol-28-network-testnet");
-    await uploadReport(REPORT_PATH, "protocol-28-network-mainnet");
+    const outcome1 = await uploadReport(REPORT_PATH, "protocol-28-network-testnet");
+    const outcome2 = await uploadReport(REPORT_PATH, "protocol-28-network-mainnet");
+
+    expect(outcome1.name).toBe(`${ARTIFACT_NAME}-protocol-28-network-testnet`);
+    expect(outcome2.name).toBe(`${ARTIFACT_NAME}-protocol-28-network-mainnet`);
 
     const names = uploadArtifactMock.mock.calls.map((call) => call[0] as string);
     expect(names).toEqual([
@@ -88,10 +107,57 @@ describe("uploadReport", () => {
 
     const outcome = await uploadReport(REPORT_PATH);
 
-    expect(outcome).toEqual({ uploaded: true });
+    expect(outcome.uploaded).toBe(true);
+    expect(outcome.id).toBe(1);
     const fallbackName = uploadArtifactMock.mock.calls[1]?.[0] as string;
+    expect(outcome.name).toBe(fallbackName);
     expect(fallbackName).toMatch(new RegExp(`^${ARTIFACT_NAME}-[a-z0-9]+-[a-z0-9]+$`));
     expect(fallbackName).not.toBe(ARTIFACT_NAME);
+  });
+
+  it("forwards retentionDays option to uploadArtifact when provided", async () => {
+    uploadArtifactMock.mockResolvedValue({ id: 42, size: 200 });
+    const outcome = await uploadReport(REPORT_PATH, undefined, 7);
+    expect(outcome).toEqual({ uploaded: true, name: ARTIFACT_NAME, id: 42 });
+    expect(uploadArtifactMock).toHaveBeenCalledWith(
+      ARTIFACT_NAME,
+      [REPORT_PATH],
+      REPORT_DIR,
+      { retentionDays: 7 },
+    );
+  });
+
+  it("forwards retentionDays during collision retry", async () => {
+    uploadArtifactMock
+      .mockRejectedValueOnce(conflictError())
+      .mockResolvedValueOnce({ id: 43, size: 200 });
+    const outcome = await uploadReport(REPORT_PATH, "protocol-28", 14);
+    expect(outcome).toEqual({
+      uploaded: true,
+      name: `${ARTIFACT_NAME}-protocol-28`,
+      id: 43,
+    });
+    expect(uploadArtifactMock).toHaveBeenNthCalledWith(
+      1,
+      ARTIFACT_NAME,
+      [REPORT_PATH],
+      REPORT_DIR,
+      { retentionDays: 14 },
+    );
+    expect(uploadArtifactMock).toHaveBeenNthCalledWith(
+      2,
+      `${ARTIFACT_NAME}-protocol-28`,
+      [REPORT_PATH],
+      REPORT_DIR,
+      { retentionDays: 14 },
+    );
+  });
+
+  it("omits id from outcome when client does not return one", async () => {
+    uploadArtifactMock.mockResolvedValue({ size: 100 });
+    const outcome = await uploadReport(REPORT_PATH);
+    expect(outcome).toEqual({ uploaded: true, name: ARTIFACT_NAME });
+    expect(outcome.id).toBeUndefined();
   });
 
   it("does not retry on a non-collision failure, and reports the reason", async () => {
@@ -102,11 +168,42 @@ describe("uploadReport", () => {
     expect(uploadArtifactMock).toHaveBeenCalledTimes(1);
   });
 
-  it("never throws when the fallback upload also fails", async () => {
+  it("never throws when the fallback upload also fails (#494)", async () => {
     uploadArtifactMock.mockRejectedValue(conflictError());
     const outcome = await uploadReport(REPORT_PATH, "protocol-28");
     expect(outcome.uploaded).toBe(false);
-    expect(uploadArtifactMock).toHaveBeenCalledTimes(2);
+    expect(outcome.reason).toContain("(409) Conflict");
+    expect(uploadArtifactMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps every report artifact across five consecutive invocations with the same differentiator (#494)", async () => {
+    const usedNames = new Set<string>();
+    uploadArtifactMock.mockImplementation(async (artifactName: string) => {
+      if (usedNames.has(artifactName)) {
+        throw conflictError();
+      }
+      usedNames.add(artifactName);
+      return { id: usedNames.size, size: 100 };
+    });
+
+    const outcomes: ArtifactUploadOutcome[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      outcomes.push(await uploadReport(REPORT_PATH, "protocol-28-config-.stellar-canary.toml"));
+    }
+
+    expect(outcomes.every((o) => o.uploaded)).toBe(true);
+    expect(usedNames.size).toBe(5);
+
+    const names = Array.from(usedNames);
+    // 1. First call uses stable ARTIFACT_NAME
+    expect(names[0]).toBe(ARTIFACT_NAME);
+    // 2. Second call uses readable differentiator name
+    expect(names[1]).toBe(`${ARTIFACT_NAME}-protocol-28-config-.stellar-canary.toml`);
+    // 3. Subsequent calls use distinct valid names
+    for (const name of names) {
+      expect(name).toMatch(/^[A-Za-z0-9._-]+$/);
+    }
+    expect(new Set(names).size).toBe(5);
   });
 
   it("handles a non-Error failure reason when upload fails", async () => {
